@@ -1,0 +1,432 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle)
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'M2ConfigFix'
+          include ':app'
+          EOF
+          mkdir -p $(dirname app/build.gradle)
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3'
+          }
+
+          android {
+              namespace 'com.m2fix.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.m2fix.app'
+                  minSdk 21
+                  // 29 keeps plain file access working on Android 10 and older.
+                  targetSdk 29
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="29" />
+              <uses-permission
+                  android:name="android.permission.READ_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="29" />
+
+              <application
+                  android:label="M2 Config Fix"
+                  android:requestLegacyExternalStorage="true"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p $(dirname app/src/main/java/com/m2fix/app/MainActivity.java)
+          cat > app/src/main/java/com/m2fix/app/MainActivity.java <<'EOF'
+          package com.m2fix.app;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ContentResolver;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.DocumentsContract;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+
+          /**
+           * Appends
+           *   [io]
+           *   file_first = true
+           * to Medieval II's medieval2.preference.cfg.
+           */
+          public class MainActivity extends Activity {
+
+              private static final String GAME_PKG = "com.feralinteractive.medieval2_android";
+              private static final String REL_PATH = "Android/data/" + GAME_PKG
+                      + "/files/feral_app_support/VFS/Local/preferences/medieval2.preference.cfg";
+              private static final String BLOCK = "[io]\nfile_first = true\n";
+
+              private static final int REQ_STORAGE = 10;
+              private static final int REQ_TREE = 20;
+              private static final int REQ_FILE = 30;
+
+              private static final String MSG_DONE = "✅ Done! \"[io] / file_first = true\" was added to the end of "
+                      + "medieval2.preference.cfg. You can start the game now.";
+              private static final String MSG_ALREADY = "✅ The config already contains file_first = true. Nothing to do.";
+              private static final String MSG_NOT_FOUND = "❌ medieval2.preference.cfg was not found.\n\n"
+                      + "Launch Medieval II once (get to the main menu), close it, then try again.";
+
+              private TextView status;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  int pad = (int) (16 * getResources().getDisplayMetrics().density);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(pad, pad, pad, pad);
+
+                  TextView title = new TextView(this);
+                  title.setText("Medieval II Config Fix");
+                  title.setTextSize(22);
+                  title.setTypeface(Typeface.DEFAULT_BOLD);
+                  root.addView(title);
+
+                  TextView info = new TextView(this);
+                  info.setText("Adds this to the end of medieval2.preference.cfg:\n\n"
+                          + "[io]\nfile_first = true\n\n"
+                          + "Tap \"Apply fix\". On Android 11 and newer a folder picker opens on the "
+                          + "Medieval II data folder. Tap \"Use this folder\" and then \"Allow\".\n\n"
+                          + "If your phone won't let you pick that folder (Android 13/14+ often blocks it), "
+                          + "use \"Apply with root\" or \"Pick the .cfg file manually\".");
+                  info.setPadding(0, pad / 2, 0, pad);
+                  root.addView(info);
+
+                  addButton(root, "Apply fix", v -> applyAuto());
+                  addButton(root, "Apply with root", v -> applyRoot());
+                  addButton(root, "Pick the .cfg file manually", v -> pickFile());
+
+                  status = new TextView(this);
+                  status.setPadding(0, pad, 0, 0);
+                  status.setTextSize(16);
+                  root.addView(status);
+
+                  ScrollView scroll = new ScrollView(this);
+                  scroll.addView(root);
+                  setContentView(scroll);
+              }
+
+              private void addButton(LinearLayout parent, String text, android.view.View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setAllCaps(false);
+                  b.setOnClickListener(l);
+                  parent.addView(b);
+              }
+
+              private void setStatus(String s) {
+                  status.setText(s);
+              }
+
+              // ---------- shared helpers ----------
+
+              private static boolean isApplied(String content) {
+                  return content.toLowerCase().replace(" ", "").replace("\t", "").contains("file_first=true");
+              }
+
+              private static String suffixFor(String content) {
+                  if (content.length() > 0 && !content.endsWith("\n")) return "\n" + BLOCK;
+                  return BLOCK;
+              }
+
+              private static String readAll(InputStream in) throws Exception {
+                  try {
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buf = new byte[4096];
+                      int n;
+                      while ((n = in.read(buf)) >= 0) out.write(buf, 0, n);
+                      return new String(out.toByteArray(), StandardCharsets.UTF_8);
+                  } finally {
+                      in.close();
+                  }
+              }
+
+              private void showError(Throwable t) {
+                  setStatus("❌ Could not edit the file:\n" + t + "\n\n"
+                          + "Make sure Medieval II has been launched at least once. If this keeps failing, "
+                          + "try \"Apply with root\" or \"Pick the .cfg file manually\".");
+              }
+
+              // ---------- method 1: automatic ----------
+
+              private void applyAuto() {
+                  if (Build.VERSION.SDK_INT < 30) {
+                      // Android 10 and older: plain file access works with the storage permission.
+                      if (Build.VERSION.SDK_INT >= 23
+                              && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                              != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, REQ_STORAGE);
+                          return;
+                      }
+                      applyDirect();
+                      return;
+                  }
+                  // Android 11+: need a folder grant through the system picker.
+                  String saved = prefs().getString("tree", null);
+                  if (saved != null) {
+                      applyTree(Uri.parse(saved));
+                  } else {
+                      launchTreePicker();
+                  }
+              }
+
+              private void applyDirect() {
+                  try {
+                      File f = new File(Environment.getExternalStorageDirectory(), REL_PATH);
+                      if (!f.exists()) {
+                          setStatus(MSG_NOT_FOUND);
+                          return;
+                      }
+                      String content = readAll(new FileInputStream(f));
+                      if (isApplied(content)) {
+                          setStatus(MSG_ALREADY);
+                          return;
+                      }
+                      try (FileOutputStream out = new FileOutputStream(f, true)) {
+                          out.write(suffixFor(content).getBytes(StandardCharsets.UTF_8));
+                      }
+                      setStatus(MSG_DONE);
+                  } catch (Throwable t) {
+                      showError(t);
+                  }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+                  if (requestCode != REQ_STORAGE) return;
+                  if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+                      applyDirect();
+                  } else {
+                      setStatus("❌ Storage permission was denied, so the file can't be edited.");
+                  }
+              }
+
+              private void launchTreePicker() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                          | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                          | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+                          | Intent.FLAG_GRANT_PREFIX_URI_PERMISSION);
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      Uri initial = DocumentsContract.buildDocumentUri(
+                              "com.android.externalstorage.documents", "primary:Android/data/" + GAME_PKG);
+                      i.putExtra(DocumentsContract.EXTRA_INITIAL_URI, initial);
+                  }
+                  try {
+                      startActivityForResult(i, REQ_TREE);
+                      setStatus("In the folder picker, tap \"Use this folder\" and then \"Allow\".");
+                  } catch (Throwable t) {
+                      showError(t);
+                  }
+              }
+
+              private void applyTree(Uri tree) {
+                  try {
+                      String treeId = DocumentsContract.getTreeDocumentId(tree);
+                      String prefix = treeId.endsWith(":") ? treeId : treeId + "/";
+                      String target = "primary:" + REL_PATH;
+                      if (!target.startsWith(prefix)) {
+                          prefs().edit().remove("tree").apply();
+                          setStatus("❌ Wrong folder selected (" + treeId + ").\n\nTap \"Apply fix\" again and "
+                                  + "choose the " + GAME_PKG + " folder inside Android/data.");
+                          return;
+                      }
+                      Uri doc = DocumentsContract.buildDocumentUriUsingTree(tree, target);
+                      if (!applyDocument(doc)) prefs().edit().remove("tree").apply();
+                  } catch (Throwable t) {
+                      prefs().edit().remove("tree").apply();
+                      showError(t);
+                  }
+              }
+
+              // ---------- method 3: user picks the file ----------
+
+              private void pickFile() {
+                  Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                  i.addCategory(Intent.CATEGORY_OPENABLE);
+                  i.setType("*/*");
+                  i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                  try {
+                      startActivityForResult(i, REQ_FILE);
+                      setStatus("Browse to Android/data/" + GAME_PKG
+                              + "/files/feral_app_support/VFS/Local/preferences and pick medieval2.preference.cfg.");
+                  } catch (Throwable t) {
+                      showError(t);
+                  }
+              }
+
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+                  Uri uri = (resultCode == RESULT_OK && data != null) ? data.getData() : null;
+                  if (uri == null) {
+                      setStatus("Cancelled.");
+                      return;
+                  }
+                  try {
+                      getContentResolver().takePersistableUriPermission(uri,
+                              Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+                  } catch (Throwable ignored) {
+                  }
+                  if (requestCode == REQ_TREE) {
+                      prefs().edit().putString("tree", uri.toString()).apply();
+                      applyTree(uri);
+                  } else if (requestCode == REQ_FILE) {
+                      applyDocument(uri);
+                  }
+              }
+
+              /** Reads the document, appends the block if missing, re-reads to verify. */
+              private boolean applyDocument(Uri doc) {
+                  try {
+                      ContentResolver cr = getContentResolver();
+                      String content = readAll(cr.openInputStream(doc));
+                      if (isApplied(content)) {
+                          setStatus(MSG_ALREADY);
+                          return true;
+                      }
+                      byte[] bytes = (content + suffixFor(content)).getBytes(StandardCharsets.UTF_8);
+                      OutputStream out;
+                      try {
+                          out = cr.openOutputStream(doc, "wt");
+                      } catch (Exception e) {
+                          out = cr.openOutputStream(doc, "w"); // new content is longer, so a full overwrite is safe
+                      }
+                      try {
+                          out.write(bytes);
+                      } finally {
+                          out.close();
+                      }
+                      if (isApplied(readAll(cr.openInputStream(doc)))) {
+                          setStatus(MSG_DONE);
+                          return true;
+                      }
+                      setStatus("❌ The file was written but the change didn't stick. Try \"Apply with root\".");
+                      return false;
+                  } catch (java.io.FileNotFoundException e) {
+                      setStatus(MSG_NOT_FOUND + "\n\n(" + e.getMessage() + ")");
+                      return false;
+                  } catch (Throwable t) {
+                      showError(t);
+                      return false;
+                  }
+              }
+
+              // ---------- method 2: root ----------
+
+              private void applyRoot() {
+                  setStatus("Requesting root access…");
+                  final String script =
+                          "for F in /storage/emulated/0/" + REL_PATH + " /data/media/0/" + REL_PATH + "; do "
+                          + "if [ -f \"$F\" ]; then "
+                          + "if grep -qiE 'file_first[[:space:]]*=[[:space:]]*true' \"$F\"; then exit 2; fi; "
+                          + "if [ -n \"$(tail -c 1 \"$F\")\" ]; then echo >> \"$F\"; fi; "
+                          + "printf '[io]\\nfile_first = true\\n' >> \"$F\"; exit 0; "
+                          + "fi; done; exit 3";
+                  new Thread(() -> {
+                      String msg;
+                      try {
+                          Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", script});
+                          int code = p.waitFor();
+                          if (code == 0) msg = MSG_DONE;
+                          else if (code == 2) msg = MSG_ALREADY;
+                          else if (code == 3) msg = MSG_NOT_FOUND;
+                          else msg = "❌ Root access was denied or the command failed (exit code " + code + ").";
+                      } catch (Throwable t) {
+                          msg = "❌ Root is not available on this phone (" + t.getMessage() + ").";
+                      }
+                      final String m = msg;
+                      runOnUiThread(() -> setStatus(m));
+                  }).start();
+              }
+
+              private SharedPreferences prefs() {
+                  return getSharedPreferences("m2fix", MODE_PRIVATE);
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Build
+        run: gradle :app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: M2ConfigFix-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
